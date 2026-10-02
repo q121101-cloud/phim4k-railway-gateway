@@ -1,0 +1,19 @@
+{
+  "name": "phim4k-railway-gateway",
+  "version": "1.0.0",
+  "description": "Production Streaming Gateway for Railway.com & Hugging Face Hub (4ke architecture)",
+  "main": "railway_gateway_server.js",
+  "scripts": {
+    "start": "node railway_gateway_server.js",
+    "dev": "nodemon railway_gateway_server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cors": "^2.8.5",
+    "express": "^4.21.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
