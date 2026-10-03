@@ -46,35 +46,51 @@ app.use(cors({
 app.disable('x-powered-by');
 
 /**
- * Hàm tính toán chữ ký xác thực chuẩn 4ke:
- * phim = MD5(streamKey hoặc fileId + SECRET_SALT)
+ * Hàm tính toán chữ ký xác thực chuẩn 4ke & Giới hạn thời gian (TTL 4 tiếng):
+ * phim = MD5(fileId + SECRET_SALT + exp)
  */
-function verifySignature(fileId, phim, fourK) {
-  if (!phim || !fourK) return false;
+function verifySignature(fileId, phim, fourK, exp) {
+  if (!phim || !fourK) return { valid: false, reason: 'missing_params' };
 
   // Kiểm tra salt 4k
   if (fourK.toLowerCase() !== CONFIG.SECRET_SALT.toLowerCase()) {
-    return false;
+    return { valid: false, reason: 'invalid_salt' };
   }
 
-  // Chấp nhận 2 cơ chế tính signature:
-  // 1. Phim4K legacy MD5(fileId)
-  const expectedMd5Direct = crypto.createHash('md5').update(fileId).digest('hex').toLowerCase();
-  if (phim.toLowerCase() === expectedMd5Direct) return true;
+  const nowSec = Math.floor(Date.now() / 1000);
 
-  // 2. Hardened HMAC-MD5(fileId, SECRET_SALT)
+  // 1. Kiểm tra tham số hết hạn (exp - Giới hạn 4 tiếng)
+  if (exp) {
+    const expNum = parseInt(exp, 10);
+    if (isNaN(expNum) || nowSec > expNum) {
+      return { valid: false, reason: 'expired' };
+    }
+    // Xác thực HMAC-MD5 với exp
+    const expectedHmacWithExp = crypto.createHash('md5').update(`${fileId}:${CONFIG.SECRET_SALT}:${exp}`).digest('hex').toLowerCase();
+    if (phim.toLowerCase() === expectedHmacWithExp) {
+      return { valid: true };
+    }
+  }
+
+  // 2. Tương thích ngược: kiểm tra HMAC-MD5 không exp
   const expectedHmac = crypto.createHash('md5').update(`${fileId}:${CONFIG.SECRET_SALT}`).digest('hex').toLowerCase();
-  if (phim.toLowerCase() === expectedHmac) return true;
+  if (phim.toLowerCase() === expectedHmac) return { valid: true };
 
-  return false;
+  // 3. Phim4K legacy MD5(fileId)
+  const expectedMd5Direct = crypto.createHash('md5').update(fileId).digest('hex').toLowerCase();
+  if (phim.toLowerCase() === expectedMd5Direct) return { valid: true };
+
+  return { valid: false, reason: 'invalid_signature' };
 }
 
 /**
- * Sinh link xem phim có chữ ký:
+ * Sinh link xem phim có chữ ký và giới hạn thời gian (Mặc định 4 tiếng):
  */
-function generateSignedUrl(baseUrl, fileId) {
-  const phim = crypto.createHash('md5').update(`${fileId}:${CONFIG.SECRET_SALT}`).digest('hex');
-  return `${baseUrl.replace(/\/+$/, '')}/${fileId}?phim=${phim}&4k=${CONFIG.SECRET_SALT}`;
+function generateSignedUrl(baseUrl, fileId, ttlHours = 4) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const expSec = nowSec + Math.floor(ttlHours * 3600);
+  const phim = crypto.createHash('md5').update(`${fileId}:${CONFIG.SECRET_SALT}:${expSec}`).digest('hex');
+  return `${baseUrl.replace(/\/+$/, '')}/${fileId}?phim=${phim}&4k=${CONFIG.SECRET_SALT}&exp=${expSec}`;
 }
 
 /**
@@ -88,7 +104,7 @@ app.get('/health', (req, res) => {
  * API sinh link xem phim (Dùng cho Admin / CMS web phim)
  */
 app.get('/api/sign', (req, res) => {
-  const { fileId } = req.query;
+  const { fileId, ttl } = req.query;
   if (!fileId) {
     return res.status(400).json({ error: 'Missing fileId query parameter' });
   }
@@ -96,30 +112,35 @@ app.get('/api/sign', (req, res) => {
   const host = req.get('host');
   const protocol = req.protocol;
   const baseUrl = `${protocol}://${host}`;
-  const signedUrl = generateSignedUrl(baseUrl, fileId);
+  const ttlHours = ttl ? parseFloat(ttl) : 4;
+  const signedUrl = generateSignedUrl(baseUrl, fileId, ttlHours);
 
   res.json({
     fileId,
     signedUrl,
+    expiresInHours: ttlHours,
     mode: CONFIG.STREAM_MODE,
     targetHfUrl: `https://huggingface.co/${CONFIG.HF_REPO}/resolve/main/${fileId}.pth`
   });
 });
 
 /**
- * CORE ENDPOINT: GET /:fileId?phim=...&4k=... (Endpoint chuẩn của 4ke)
+ * CORE ENDPOINT: GET /:fileId?phim=...&4k=...&exp=... (Endpoint chuẩn của 4ke + TTL 4h)
  */
 app.get('/:fileId', async (req, res) => {
   const { fileId } = req.params;
-  const { phim, fourK, '4k': fourKAlt, mode } = req.query;
+  const { phim, fourK, '4k': fourKAlt, exp, mode } = req.query;
   const activeFourK = fourK || fourKAlt;
 
-  // 1. Xác thực Chữ Ký / Token
-  const isValid = verifySignature(fileId, phim, activeFourK);
-  if (!isValid) {
+  // 1. Xác thực Chữ Ký / Token & Hạn 4 tiếng
+  const authResult = verifySignature(fileId, phim, activeFourK, exp);
+  if (!authResult || !authResult.valid) {
+    const isExpired = authResult && authResult.reason === 'expired';
     return res.status(403).json({
       error: '403 Forbidden',
-      message: 'Chữ ký token (phim hoặc 4k) không hợp lệ hoặc đã hết hạn.'
+      message: isExpired
+        ? 'Đường link này đã hết hạn sau 4 tiếng (Link expired after 4 hours). Vui lòng tải lại link mới từ dashboard.'
+        : 'Chữ ký token (phim hoặc 4k) không hợp lệ.'
     });
   }
 
